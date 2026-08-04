@@ -70,6 +70,10 @@ class MainActivity : AppCompatActivity() {
     // Input prediction for low-latency gaming
     private val inputPredictor = InputPredictor()
 
+    // Stylus stroke state. Never consulted by the predictor: a stylus stroke carries
+    // measured samples only (R5).
+    private val stylusInput = StylusInput()
+
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
     private var checklistRunnable: Runnable? = null
@@ -362,6 +366,11 @@ class MainActivity : AppCompatActivity() {
             handleTouch(view, event)
             true
         }
+        // R1. Hover arrives through `View.dispatchHoverEvent`, never the touch
+        // listener, so it needs its own registration on the same two views.
+        stylusInput.setHoverEnabled(prefs.stylusHoverEnabled)
+        binding.surfaceView.setOnHoverListener { view, event -> handleStylusHover(view, event) }
+        binding.textureView.setOnHoverListener { view, event -> handleStylusHover(view, event) }
     }
 
     private fun setupUI() {
@@ -1342,10 +1351,182 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * `MotionEvent` adapter for the stylus path. Extracts tool type, pointer ids,
+     * normalized coordinates, pressure and the coalesced history into plain data,
+     * lets [StylusInput] decide, then sends whatever it asked for. Returns true when
+     * the stylus path owns this event and the existing touch body must not run.
+     *
+     * The extraction lives here rather than in [StylusInput] so that class stays
+     * free of framework types: `MotionEvent.obtain(...)` is not mocked in unit tests.
+     */
+    private fun handleStylusTouch(
+        view: View,
+        event: MotionEvent,
+    ): Boolean {
+        val client = streamClient
+        if (client == null || !client.stylusSupported) {
+            // No host support: the existing touch path handles the pen as a finger,
+            // exactly as it does today.
+            stylusInput.reset()
+            return false
+        }
+
+        val action =
+            when (event.actionMasked) {
+                MotionEvent.ACTION_DOWN -> StylusInput.Action.DOWN
+                MotionEvent.ACTION_POINTER_DOWN -> StylusInput.Action.POINTER_DOWN
+                MotionEvent.ACTION_MOVE -> StylusInput.Action.MOVE
+                MotionEvent.ACTION_UP -> StylusInput.Action.UP
+                MotionEvent.ACTION_POINTER_UP -> StylusInput.Action.POINTER_UP
+                MotionEvent.ACTION_CANCEL -> StylusInput.Action.CANCEL
+                else -> return false
+            }
+
+        val pointerCount = event.pointerCount
+        var hasStylus = false
+        for (i in 0 until pointerCount) {
+            if (StylusInput.toolFor(event.getToolType(i)) == StylusInput.Tool.STYLUS) {
+                hasStylus = true
+                break
+            }
+        }
+        // Fast path: no pen involved and nothing suppressed, so nothing to decide.
+        if (!hasStylus && !stylusInput.isActive(event.eventTime)) return false
+
+        val width = view.width.toFloat()
+        val height = view.height.toFloat()
+        val historySize = event.historySize
+        val pointers = ArrayList<StylusInput.Pointer>(pointerCount)
+        for (i in 0 until pointerCount) {
+            val tool = StylusInput.toolFor(event.getToolType(i))
+            val isStylus = tool == StylusInput.Tool.STYLUS
+            // R6. Only the stylus needs its history; a finger's samples are dropped anyway.
+            val history =
+                if (isStylus && historySize > 0) {
+                    ArrayList<StylusInput.Point>(historySize).also { out ->
+                        for (h in 0 until historySize) {
+                            out.add(
+                                StylusInput.Point(
+                                    StylusInput.normalize(event.getHistoricalX(i, h), width, displayFlipHorizontal),
+                                    StylusInput.normalize(event.getHistoricalY(i, h), height, displayFlipVertical),
+                                    event.getHistoricalPressure(i, h),
+                                ),
+                            )
+                        }
+                    }
+                } else {
+                    emptyList()
+                }
+            pointers.add(
+                StylusInput.Pointer(
+                    id = event.getPointerId(i),
+                    tool = tool,
+                    point =
+                        StylusInput.Point(
+                            StylusInput.normalize(event.getX(i), width, displayFlipHorizontal),
+                            StylusInput.normalize(event.getY(i), height, displayFlipVertical),
+                            event.getPressure(i),
+                        ),
+                    history = history,
+                ),
+            )
+        }
+
+        val device = event.device
+        val decision =
+            stylusInput.process(
+                StylusInput.Frame(
+                    action = action,
+                    actionPointerId = event.getPointerId(event.actionIndex),
+                    pointers = pointers,
+                    canceled = event.flags and MotionEvent.FLAG_CANCELED != 0,
+                    // R12. Unknown device means "assume real pressure"; only a device that
+                    // explicitly reports no pressure axis gets full scale substituted.
+                    hasPressureAxis = device == null || device.getMotionRange(MotionEvent.AXIS_PRESSURE) != null,
+                    eventTimeMs = event.eventTime,
+                ),
+            )
+
+        for (send in decision.sends) {
+            client.sendStylus(send.action, send.samples)
+        }
+        return decision.handled
+    }
+
+    /**
+     * `MotionEvent` adapter for the hover path (follow-up plan U1).
+     *
+     * Hover is dispatched through `View.dispatchHoverEvent`, which is why this hangs
+     * off `setOnHoverListener` rather than the touch listener — the two streams never
+     * meet in the framework, and routing hover through `handleTouch` would mean
+     * inventing a touch action for it.
+     *
+     * Gated on the same capability bit as strokes (KTD1): a host that never
+     * advertised it rejects the message type outright, and the client-side hover
+     * preference (R8) is checked inside [StylusInput] so the rule is testable.
+     */
+    private fun handleStylusHover(
+        view: View,
+        event: MotionEvent,
+    ): Boolean {
+        val client = streamClient
+        if (client == null || !client.stylusSupported) {
+            // No host support: nothing to forward, and no proximity may survive a
+            // capability that went away underneath us.
+            stylusInput.reset()
+            return false
+        }
+
+        val action =
+            when (event.actionMasked) {
+                MotionEvent.ACTION_HOVER_ENTER -> StylusInput.HoverAction.ENTER
+                MotionEvent.ACTION_HOVER_MOVE -> StylusInput.HoverAction.MOVE
+                MotionEvent.ACTION_HOVER_EXIT -> StylusInput.HoverAction.EXIT
+                else -> return false
+            }
+
+        val width = view.width.toFloat()
+        val height = view.height.toFloat()
+        val index = event.actionIndex
+        // R2. `AXIS_DISTANCE` is read, never forwarded — it is the only signal that
+        // separates "the nib reached the glass" from "the pen left range". A device
+        // that does not report the axis yields null, and the exit is forwarded.
+        val distance =
+            if (event.device?.getMotionRange(MotionEvent.AXIS_DISTANCE, event.source) != null) {
+                event.getAxisValue(MotionEvent.AXIS_DISTANCE, index)
+            } else {
+                null
+            }
+
+        val decision =
+            stylusInput.processHover(
+                StylusInput.HoverFrame(
+                    action = action,
+                    tool = StylusInput.toolFor(event.getToolType(index)),
+                    point =
+                        StylusInput.Point(
+                            StylusInput.normalize(event.getX(index), width, displayFlipHorizontal),
+                            StylusInput.normalize(event.getY(index), height, displayFlipVertical),
+                            0f,
+                        ),
+                    distance = distance,
+                    eventTimeMs = event.eventTime,
+                ),
+            )
+
+        for (send in decision.sends) {
+            client.sendStylus(send.action, send.samples)
+        }
+        return decision.handled
+    }
+
     private fun handleTouch(
         view: View,
         event: MotionEvent,
     ) {
+        if (handleStylusTouch(view, event)) return
+
         val rawX = event.x / view.width.toFloat()
         val rawY = event.y / view.height.toFloat()
         val x = if (displayFlipHorizontal) 1f - rawX else rawX

@@ -46,6 +46,15 @@ class StreamClient(
     @Volatile var codecNegotiated = false
         private set
 
+    /**
+     * True once the host advertised the stylus capability bit in its display config.
+     * Stylus messages are sent only while this is set: an old host would log and
+     * resync one byte at a time through a file-backed logger, which stalls its
+     * receive queue rather than degrading it.
+     */
+    @Volatile var stylusSupported = false
+        private set
+
     private var bytesReceived = 0L
     private var framesReceived = 0L
     private var diagFrameCount = 0L
@@ -126,6 +135,7 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(socket?.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                stylusSupported = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
@@ -255,6 +265,7 @@ class StreamClient(
                 outputStream = java.io.DataOutputStream(s.getOutputStream())
                 streamCodecIsHevc = true
                 codecNegotiated = false
+                stylusSupported = false
                 advertiseAvcOnlyIfNeeded() // MUST precede type 8: type 8 can trigger the server's early protocol finish
                 advertiseDecoderLimits() // Also before type 8, for the same reason
                 advertiseFrameMetadataSupport()
@@ -341,6 +352,7 @@ class StreamClient(
                             val flags = transform / 1000
                             val flipHorizontal = flags and 1 == 1
                             val flipVertical = flags and 2 == 2
+                            stylusSupported = flags and DISPLAY_FLAG_STYLUS == DISPLAY_FLAG_STYLUS
                             diagLog("Display config: ${width}x$height @ $rotation°, h=$flipHorizontal, v=$flipVertical")
                             onDisplaySize?.invoke(width, height, rotation, flipHorizontal, flipVertical)
                         }
@@ -405,6 +417,29 @@ class StreamClient(
                     }
                     buffer.putInt(action)
                     out.write(buffer.array())
+                    out.flush()
+                }
+            } catch (_: Exception) {
+            }
+        }
+    }
+
+    /**
+     * Send one stylus message. Encoding happens on the caller's thread; the write
+     * goes out on `touchScope`, the same single-thread executor that serializes
+     * `sendTouch`, `sendPing` and keyframe requests — a write from any other
+     * thread could interleave with a ping and desync the host's parser.
+     */
+    fun sendStylus(
+        action: StylusWire.Action,
+        samples: List<StylusWire.Sample>,
+    ) {
+        if (!isConnected || !stylusSupported || samples.isEmpty()) return
+        val payload = StylusWire.encode(action, samples)
+        touchScope.launch {
+            try {
+                socket?.getOutputStream()?.let { out ->
+                    out.write(payload)
                     out.flush()
                 }
             } catch (_: Exception) {
@@ -607,6 +642,7 @@ class StreamClient(
         private const val MESSAGE_CLIENT_AVC_ONLY = 9
         private const val MESSAGE_CODEC_SELECTED = 10
         private const val MESSAGE_CLIENT_DECODER_LIMITS = 11
+        private const val DISPLAY_FLAG_STYLUS = 4
         private const val FRAME_FLAG_KEYFRAME = 1
         private const val KEYFRAME_REQUEST_FLAG_FORCE = 1
 

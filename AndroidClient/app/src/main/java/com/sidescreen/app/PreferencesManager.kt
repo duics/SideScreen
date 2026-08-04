@@ -41,6 +41,12 @@ class PreferencesManager(
         get() = prefs.getBoolean("hide_settings_button", false)
         set(value) = prefs.edit().putBoolean("hide_settings_button", value).apply()
 
+    // R8/KD3. Opt-out, defaulting on: a cursor that follows the pen is the expected
+    // behavior on every comparable device. Turning it off leaves drawing unchanged.
+    var stylusHoverEnabled: Boolean
+        get() = prefs.getBoolean("stylus_hover", true)
+        set(value) = prefs.edit().putBoolean("stylus_hover", value).apply()
+
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()

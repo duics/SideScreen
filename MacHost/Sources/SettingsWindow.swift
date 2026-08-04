@@ -472,22 +472,33 @@ struct SettingsView: View {
 
                                 HStack {
                                     VStack(alignment: .leading, spacing: 2) {
-                                        Text("Pen / Draw Mode")
+                                        Text("Draw with Finger")
                                             .font(.system(size: 12, weight: .medium))
-                                        Text("Draw with a stylus instead of scrolling")
+                                        Text("Let a finger draw the way the S Pen already does")
                                             .font(.system(size: 10))
                                             .foregroundColor(.secondary)
                                     }
                                     Spacer()
+                                    // Stored key unchanged, so an existing preference survives.
                                     Toggle("", isOn: $settings.penModeEnabled)
                                         .labelsHidden()
                                 }
                                 .disabled(!settings.touchEnabled)
 
-                                if settings.penModeEnabled && settings.touchEnabled {
-                                    Text("Drawing mode is on — 1-finger scroll, momentum and tap-and-hold right click are off. Tap, double tap, two-finger scroll and pinch still work.")
-                                        .font(.system(size: 10))
-                                        .foregroundColor(.orange)
+                                // Rendered in BOTH states: the sentence a confused user most
+                                // needs — the S Pen draws whether or not this is on — is the
+                                // off-state one, and gating the explainer on the toggle would
+                                // show it only when it is already unnecessary.
+                                if settings.touchEnabled {
+                                    if settings.penModeEnabled {
+                                        Text("A finger draws instead of scrolling — 1-finger scroll, momentum and tap-and-hold right click are off. Tap, double tap, two-finger scroll and pinch still work. The S Pen draws either way.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.orange)
+                                    } else {
+                                        Text("A finger scrolls, taps and pinches as usual. The S Pen still draws — it does not need this setting, but it does need Touch Input above.")
+                                            .font(.system(size: 10))
+                                            .foregroundColor(.secondary)
+                                    }
                                 }
                             }
                         }
@@ -752,9 +763,11 @@ struct SettingsView: View {
                                     hint: "macOS privacy permission required to capture the virtual display. Grant in System Settings → Privacy & Security → Screen Recording."
                                 )
                                 StatusRow(title: "Accessibility",
-                                          status: settings.hasAccessibilityPermission ? "Granted" : "Optional",
-                                          color: settings.hasAccessibilityPermission ? .green : .orange,
-                                          hint: "Optional permission. Required only if you want touch/tap input from the tablet to control the Mac. Streaming works without it.")
+                                          status: settings.hasAccessibilityPermission ? "Granted" : (settings.touchEnabled ? "Required" : "Optional"),
+                                          color: settings.hasAccessibilityPermission ? .green : (settings.touchEnabled ? .red : .orange),
+                                          hint: settings.hasAccessibilityPermission || !settings.touchEnabled
+                                              ? "Optional permission. Required only if you want touch/tap input from the tablet to control the Mac. Streaming works without it."
+                                              : "Touch input is enabled but this permission is missing — touch and pen input will not reach the Mac until you grant it in System Settings → Privacy & Security → Accessibility. Streaming still works without it.")
                                 if settings.isRunning {
                                     StatusRow(title: "Capture Method",
                                               status: settings.captureMethod,

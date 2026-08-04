@@ -21,6 +21,10 @@ private enum WireMessage {
     /// #41). Every payload byte has the high bit set, so old hosts that
     /// consume unknown types byte-by-byte skip the payload harmlessly.
     static let clientDecoderLimits: UInt8 = 11
+    /// Client→server, 4-byte header + 6 bytes per sample: one batch of stylus
+    /// samples (see `StylusCodec`). Sent only by clients that saw the stylus
+    /// capability bit in the display config, so an old host never receives one.
+    static let stylusEvent = StylusCodec.messageType
 }
 
 private extension NWEndpoint {
@@ -51,6 +55,10 @@ class StreamingServer {
     var onCodecNegotiated: ((StreamCodec) -> Void)?
     // Touch callback: (x1, y1, action, pointerCount, x2, y2)
     var onTouchEvent: ((Float, Float, Int, Int, Float, Float) -> Void)?
+    /// One call per decoded stylus message, carrying the whole sample batch —
+    /// never one call per sample (R7 removes the rate cap from this path, so a
+    /// 64-sample message would otherwise become 64 main-queue hops).
+    var onStylusEvent: ((StylusMessage) -> Void)?
     var onStats: ((Double, Double) -> Void)?
     var onKeyframeRequested: ((Bool) -> Void)?
     // Whether host wants to receive touch events from client. Ping/pong is
@@ -85,6 +93,7 @@ class StreamingServer {
     /// Max decode size reported by the connected client (issue #41).
     private(set) var clientDecodeLimits: (width: Int, height: Int)?
     private var inputBuffer = Data()
+    private var stylusRateLimiter = StylusRateLimiter()
 
     init(port: UInt16) {
         self.port = port
@@ -139,6 +148,7 @@ class StreamingServer {
         clientDecodeLimits = nil
         waitingForSyncFrame = true
         inputBuffer.removeAll(keepingCapacity: true)
+        stylusRateLimiter = StylusRateLimiter()
         connection = newConnection
         droppedFrames = 0
 
@@ -298,7 +308,12 @@ class StreamingServer {
     func sendDisplaySize() {
         guard let connection = connection else { return }
 
-        let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0)
+        // The client reads flags as transform / 1000 and rotation as % 1000, and
+        // tests only bits 0 (flipH) and 1 (flipV). Bit 2 — the 4000 — advertises
+        // that this host understands the stylus message; an old client ignores
+        // the bit and an old host never sets it, so no client ever sends stylus
+        // messages to a host that would log them byte-by-byte.
+        let transform = rotation + (flipHorizontal ? 1000 : 0) + (flipVertical ? 2000 : 0) + 4000
         var data = Data()
         data.append(WireMessage.displayConfig)
         data.append(contentsOf: withUnsafeBytes(of: Int32(displayWidth).bigEndian) { Data($0) })
@@ -435,6 +450,35 @@ class StreamingServer {
                 if w >= 256 && h >= 256 {
                     clientDecodeLimits = (w, h)
                     debugLog("Client decoder limit: \(w)x\(h)")
+                }
+
+            case WireMessage.stylusEvent:
+                // Type + action + format + count, then 6 bytes per sample. The
+                // header is bounded at 4 + 64*6 bytes, so classifying only that
+                // prefix sees every possible whole message.
+                switch StylusCodec.frame(inputBuffer.prefix(StylusCodec.maxMessageSize)) {
+                case .incomplete:
+                    return
+                case .invalidHeader:
+                    // Resync one byte at a time, exactly as the touch and
+                    // decoder-limits cases do (R24).
+                    consumeInputBytes(1)
+                case .complete(let length):
+                    let message = Data(inputBuffer.prefix(length))
+                    // Consume the exact frame before any drop decision, so a
+                    // skipped message never disturbs the ones behind it.
+                    consumeInputBytes(length)
+                    // One main-queue hop per message with the whole batch, above
+                    // the sanity ceiling (R23) and outside the finger path's
+                    // rate cap (R7).
+                    if touchEnabled, let decoded = StylusCodec.decode(message) {
+                        if stylusRateLimiter.admit(action: decoded.action,
+                                                   sampleCount: decoded.samples.count) {
+                            DispatchQueue.main.async { self.onStylusEvent?(decoded) }
+                        } else if stylusRateLimiter.shouldLogDrop {
+                            debugLog("Stylus sample ceiling exceeded — dropping excess (logged once per connection)")
+                        }
+                    }
                 }
 
             default:

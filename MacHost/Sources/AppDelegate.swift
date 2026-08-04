@@ -135,6 +135,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.adbInstalled = StatusDetector.adbInstalled()
         settings.wifiConnected = StatusDetector.wifiReachable()
         settings.listeningAddress = LANAddressResolver.primaryIPv4()
+        // Accessibility can be granted (or revoked) while we run — poll it here so the
+        // Status rows self-correct instead of staying stale until the next launch.
+        settings.hasAccessibilityPermission = AXIsProcessTrusted()
 
         // While a wireless client is actively streaming, keep its lastConnected
         // rolling forward so the UI shows "just now". On disconnect, the
@@ -379,9 +382,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
             settings.hasAccessibilityPermission = trusted
         }
         if trusted {
-            print("✅ Accessibility permission granted")
+            debugLog("✅ Accessibility permission granted")
         } else {
-            print("⚠️  Accessibility permission not granted - touch control will not work")
+            debugLog("⚠️  Accessibility permission not granted - touch control will not work")
         }
     }
 
@@ -393,7 +396,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         settings.hasAccessibilityPermission = trusted
 
         if !trusted {
-            print("⚠️  User needs to grant Accessibility permission in System Settings")
+            debugLog("⚠️  User needs to grant Accessibility permission in System Settings")
         }
     }
 
@@ -613,6 +616,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
                 guard let self = self else { return }
                 self.screenCapture?.requestKeyframeOrReplayCachedFrame(force: true)
                 Task { @MainActor in
+                    // A client that vanished mid-stroke leaves the stroke open; unlike
+                    // onClientDisconnected this path never released anything, so the new
+                    // session would inherit a held button (R16).
+                    self.stylusHost.close(.newClientConnected)
                     self.settings.clientConnected = true
                 }
             }
@@ -655,6 +662,13 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
             streamingServer?.onTouchEvent = { [weak self] x, y, action, pointerCount, x2, y2 in
                 self?.handleTouch(x: x, y: y, action: action, pointerCount: pointerCount, x2: x2, y2: y2)
+            }
+
+            // R13/R21. The pen draws on contact with no setting of its own, but honors the
+            // same `touchEnabled` gate and Accessibility check the touch path does.
+            streamingServer?.onStylusEvent = { [weak self] message in
+                guard let self, self.settings.touchEnabled, self.accessibilityTrusted() else { return }
+                self.stylusHost.handle(message)
             }
 
             streamingServer?.onStats = { [weak self] fps, mbps in
@@ -718,6 +732,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     // MARK: - Gesture Properties
 
     private let eventSource = CGEventSource(stateID: .hidSystemState)
+    /// The whole stylus path (KTD5 keeps its logic out of this file). The gesture cancel
+    /// stays here because it reaches private members: KTD10/R19 needs `penDown`'s prologue
+    /// *plus* the unconditional clear the prologue does not do, because `oneFingerUp`
+    /// completes what is pending — a right click from `.longPressReady`, a click from
+    /// `.pending`, momentum from `.scrolling` — instead of abandoning it.
+    private lazy var stylusHost = StylusHost(
+        eventSource: eventSource,
+        displayBounds: { [weak self] in
+            self?.virtualDisplayManager?.displayID.map(CGDisplayBounds)
+        },
+        cancelHostGesture: { [weak self] in
+            guard let self else { return }
+            self.stopMomentumScroll()
+            self.cancelLongPressTimer()
+            self.releaseHeldMouseButtonIfNeeded()
+            self.gestureState = .idle
+        },
+        // The two states that hold the left button physically down. A hovering pen
+        // must not move the cursor out from under one of them.
+        fingerButtonHeld: { [weak self] in
+            self?.gestureState == .dragging || self?.gestureState == .penDrawing
+        }
+    )
     private var accessibilityWarningShown = false
     private var gestureState: GestureState = .idle
     private var lastTouchTime: UInt64 = 0
@@ -751,19 +788,29 @@ class AppDelegate: NSObject, NSApplicationDelegate {
 
     // MARK: - Touch Entry Point
 
-    func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
-        guard settings.touchEnabled else { return }
-
+    /// R21. Both input paths ask this — the warning flag is private state, so a second
+    /// inline copy of the check would create two flags that disagree and the stylus
+    /// path would either warn twice or die silently.
+    private func accessibilityTrusted() -> Bool {
         if !AXIsProcessTrusted() {
             if !accessibilityWarningShown {
                 accessibilityWarningShown = true
-                print("⚠️  Accessibility not granted - touch ignored")
+                debugLog("⚠️  Accessibility not granted - touch ignored")
                 Task { @MainActor in
                     settings.hasAccessibilityPermission = false
                 }
             }
-            return
+            return false
         }
+        return true
+    }
+
+    func handleTouch(x: Float, y: Float, action: Int, pointerCount: Int = 1, x2: Float = 0, y2: Float = 0) {
+        guard settings.touchEnabled else { return }
+
+        guard accessibilityTrusted() else { return }
+
+        guard !stylusHost.suppressesFingerEvent() else { return }
 
         guard let displayID = virtualDisplayManager?.displayID else { return }
         let bounds = CGDisplayBounds(displayID)
@@ -780,8 +827,10 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         if pointerCount >= 2 {
             handleTwoFingerTouch(p1: p1, p2: p2, action: action)
         } else if settings.penModeEnabled {
-            // Pen mode: single pointer draws directly. 2-finger gestures above are
-            // untouched, so scroll/pinch still work for panning and zooming a canvas.
+            // R14: this toggle governs fingers only. A stylus never arrives here — it
+            // comes in on its own message and draws with no setting (R13). A single
+            // finger draws directly; 2-finger gestures above are untouched, so
+            // scroll/pinch still work for panning and zooming a canvas.
             handlePenTouch(at: p1, action: action)
         } else {
             handleOneFingerTouch(at: p1, action: action)
@@ -886,6 +935,11 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     /// being turned off, or the app quitting. Without this the button stays physically down
     /// and every later cursor move drags across the Mac until the user clicks a real mouse.
     private func releaseHeldMouseButtonIfNeeded() {
+        // Ahead of the guard below, deliberately: stylus state is not in `gestureState`
+        // (KTD9), so a stylus stroke never satisfies that guard and a close placed inside
+        // the body would be unreachable on all five teardown paths.
+        stylusHost.close(.hostReleasedButton)
+
         guard gestureState == .penDrawing || gestureState == .dragging else { return }
         injectMouseUp(at: touchLastPosition)
         gestureState = .idle
