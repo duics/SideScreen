@@ -3,6 +3,7 @@ package com.sidescreen.app
 import android.view.MotionEvent
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -314,8 +315,9 @@ class StylusInputTest {
         assertEquals(1f, sample.pressure, 0f)
         // And it survives the wire as full scale rather than wrapping.
         val bytes = StylusWire.encode(StylusWire.Action.DOWN, listOf(sample))
-        assertEquals(0xFF, bytes[8].toInt() and 0xFF)
-        assertEquals(0xFF, bytes[9].toInt() and 0xFF)
+        val pressureAt = StylusWire.HEADER_SIZE + 4
+        assertEquals(0xFF, bytes[pressureAt].toInt() and 0xFF)
+        assertEquals(0xFF, bytes[pressureAt + 1].toInt() and 0xFF)
     }
 
     // --- R22: staleness ---------------------------------------------------------------
@@ -677,6 +679,118 @@ class StylusInputTest {
         assertFalse(core.isActive(0))
     }
 
+    // --- Trigger binding ------------------------------------------------------------
+
+    private fun buttonDown(
+        core: StylusInput,
+        held: Boolean,
+        t: Long = 0,
+    ) = core.process(
+        StylusInput.Frame(
+            StylusInput.Action.DOWN,
+            1,
+            listOf(stylus()),
+            eventTimeMs = t,
+            barrelButtonHeld = held,
+        ),
+    )
+
+    /** Nothing is bound out of the box, so a held button changes nothing. */
+    @Test
+    fun anUnboundTriggerProducesNoFlags() {
+        val core = StylusInput()
+        assertEquals(0, buttonDown(core, held = true).sends.single().flags)
+    }
+
+    /** The barrel button, bound to a secondary click, marks the contact. */
+    @Test
+    fun aBoundBarrelButtonMarksTheContactSecondary() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.SECONDARY_CLICK)
+        assertEquals(StylusWire.FLAG_SECONDARY, buttonDown(core, held = true).sends.single().flags)
+        // And releasing it goes back to an ordinary contact.
+        core.process(frame(StylusInput.Action.UP, 1, listOf(stylus()), eventTimeMs = 10))
+        assertEquals(0, buttonDown(core, held = false, t = 20).sends.single().flags)
+    }
+
+    /** The same trigger bound to eraser produces the eraser flag instead. */
+    @Test
+    fun theSameTriggerCanMeanEraserInstead() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.ERASER)
+        assertEquals(StylusWire.FLAG_ERASER, buttonDown(core, held = true).sends.single().flags)
+    }
+
+    /**
+     * The rule the mapping exists to enforce: one trigger cannot mean two things.
+     * Binding it again moves it rather than adding a second meaning.
+     */
+    @Test
+    fun aTriggerCannotBeBoundTwice() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.SECONDARY_CLICK)
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.ERASER)
+
+        assertEquals(StylusWire.FLAG_ERASER, buttonDown(core, held = true).sends.single().flags)
+        assertNull("the old meaning is gone, not stacked",
+            core.triggerFor(StylusInput.PenAction.SECONDARY_CLICK))
+        assertEquals(StylusInput.Trigger.BARREL_BUTTON, core.triggerFor(StylusInput.PenAction.ERASER))
+    }
+
+    /** And one action cannot be reached by two triggers, so the relation stays one to one. */
+    @Test
+    fun anActionKeepsOnlyItsMostRecentTrigger() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.ERASER_TOOL, StylusInput.PenAction.ERASER)
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.ERASER)
+        assertEquals(StylusInput.Trigger.BARREL_BUTTON, core.triggerFor(StylusInput.PenAction.ERASER))
+        assertEquals(1, core.currentBindings().size)
+    }
+
+    /** An eraser-reporting pen binds without the user touching a button. */
+    @Test
+    fun theEraserToolIsATriggerInItsOwnRight() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.ERASER_TOOL, StylusInput.PenAction.ERASER)
+        val eraser = StylusInput.Pointer(1, StylusInput.Tool.ERASER, point(0.5f, 0.5f))
+        val down = core.process(frame(StylusInput.Action.DOWN, 1, listOf(eraser)))
+        assertEquals(StylusWire.FLAG_ERASER, down.sends.single().flags)
+    }
+
+    /**
+     * Triggers are discovered, not declared. A device that never emits one never
+     * offers it — the Tab S9's pen reports no eraser tool on either end, so the
+     * settings UI must not offer to bind one.
+     */
+    @Test
+    fun triggersAreDiscoveredFromWhatTheDeviceActuallyEmits() {
+        val core = StylusInput()
+        assertTrue("nothing seen yet", core.triggersSeen().isEmpty())
+
+        buttonDown(core, held = true)
+        assertEquals(setOf(StylusInput.Trigger.BARREL_BUTTON), core.triggersSeen())
+    }
+
+    /** Decided at the press and carried to the release, the way click count is. */
+    @Test
+    fun aButtonPressedMidStrokeDoesNotChangeTheContact() {
+        val core = StylusInput()
+        core.bind(StylusInput.Trigger.BARREL_BUTTON, StylusInput.PenAction.SECONDARY_CLICK)
+
+        assertEquals(0, buttonDown(core, held = false).sends.single().flags)
+        val moved =
+            core.process(
+                StylusInput.Frame(
+                    StylusInput.Action.MOVE,
+                    1,
+                    listOf(stylus(x = 0.6f)),
+                    eventTimeMs = 10,
+                    barrelButtonHeld = true,
+                ),
+            )
+        assertEquals("the contact keeps the meaning it opened with", 0, moved.sends.single().flags)
+    }
+
     // --- R9 / AE5: the wrist-before-pen gap ------------------------------------------
 
     /**
@@ -790,7 +904,9 @@ class StylusInputTest {
     fun eraserToolTakesTheStylusPath() {
         assertEquals(MotionEvent.TOOL_TYPE_STYLUS, StylusInput.TOOL_TYPE_STYLUS)
         assertEquals(MotionEvent.TOOL_TYPE_ERASER, StylusInput.TOOL_TYPE_ERASER)
-        assertEquals(StylusInput.Tool.STYLUS, StylusInput.toolFor(MotionEvent.TOOL_TYPE_ERASER))
+        assertEquals(StylusInput.Tool.ERASER, StylusInput.toolFor(MotionEvent.TOOL_TYPE_ERASER))
+        assertTrue("an eraser is a stylus for every routing decision",
+            StylusInput.toolFor(MotionEvent.TOOL_TYPE_ERASER).isStylus)
         assertEquals(StylusInput.Tool.STYLUS, StylusInput.toolFor(MotionEvent.TOOL_TYPE_STYLUS))
         assertEquals(StylusInput.Tool.FINGER, StylusInput.toolFor(MotionEvent.TOOL_TYPE_FINGER))
         assertEquals(StylusInput.Tool.FINGER, StylusInput.toolFor(MotionEvent.TOOL_TYPE_UNKNOWN))

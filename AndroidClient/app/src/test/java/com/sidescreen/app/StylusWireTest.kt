@@ -41,7 +41,7 @@ class StylusWireTest {
             )
         val expected =
             byteArrayOf(
-                0x0C, 0x01, 0x01, 0x02,
+                0x0C, 0x01, 0x02, 0x00, 0x02,
                 0x40, 0x00, 0xBF.toByte(), 0xFF.toByte(), 0xFF.toByte(), 0xFF.toByte(),
                 0x00, 0x00, 0xFF.toByte(), 0xFF.toByte(), 0x20, 0x00,
             )
@@ -60,8 +60,9 @@ class StylusWireTest {
 
         assertEquals(StylusWire.MESSAGE_TYPE, bytes[0].toInt())
         assertEquals(StylusWire.Action.MOVE.code, bytes[1].toInt())
-        assertEquals(StylusWire.SAMPLE_FORMAT_XYP, bytes[2].toInt())
-        assertEquals(3, bytes[3].toInt())
+        assertEquals(StylusWire.SAMPLE_FORMAT_XYP_FLAGS, bytes[2].toInt())
+        assertEquals("no trigger bound, so no flags", 0, bytes[3].toInt())
+        assertEquals(3, bytes[4].toInt())
         assertEquals(StylusWire.HEADER_SIZE + 3 * StylusWire.SAMPLE_SIZE, bytes.size)
 
         for (i in samples.indices) {
@@ -99,9 +100,9 @@ class StylusWireTest {
     fun roundTripsSingleSampleDown() {
         val sample = StylusWire.Sample(0.4f, 0.6f, 0.2f)
         val bytes = StylusWire.encode(StylusWire.Action.DOWN, listOf(sample))
-        assertEquals(10, bytes.size)
+        assertEquals(11, bytes.size)
         assertEquals(StylusWire.Action.DOWN.code, bytes[1].toInt())
-        assertEquals(1, bytes[3].toInt())
+        assertEquals(1, bytes[4].toInt())
         val decoded = sampleAt(bytes, 0)
         assertEquals(sample.x, decoded.x, step)
         assertEquals(sample.y, decoded.y, step)
@@ -116,8 +117,8 @@ class StylusWireTest {
             }
         val bytes = StylusWire.encode(StylusWire.Action.MOVE, samples)
         assertEquals(StylusWire.HEADER_SIZE + StylusWire.MAX_SAMPLES * StylusWire.SAMPLE_SIZE, bytes.size)
-        assertEquals(388, bytes.size)
-        assertEquals(StylusWire.MAX_SAMPLES, bytes[3].toInt())
+        assertEquals(389, bytes.size)
+        assertEquals(StylusWire.MAX_SAMPLES, bytes[4].toInt())
         for (i in samples.indices) {
             val decoded = sampleAt(bytes, i)
             assertEquals(samples[i].x, decoded.x, step)
@@ -176,7 +177,7 @@ class StylusWireTest {
             )
         val expected =
             byteArrayOf(
-                0x0C, 0x04, 0x01, 0x01,
+                0x0C, 0x04, 0x02, 0x00, 0x01,
                 0x40, 0x00, 0xBF.toByte(), 0xFF.toByte(), 0x00, 0x00,
             )
         assertArrayEquals(expected, bytes)

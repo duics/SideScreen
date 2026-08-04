@@ -8,9 +8,13 @@ final class StylusCodecTests: XCTestCase {
     /// The client's encoder, mirrored here so the host side has a round trip to
     /// assert against. Production code on this side only ever decodes; the real
     /// encoder is `StylusWire.encode` in the Android client.
-    private func encode(_ action: StylusAction, _ samples: [StylusSample]) -> Data {
+    private func encode(_ action: StylusAction, _ samples: [StylusSample], flags: UInt8 = 0) -> Data {
         var bytes: [UInt8] = [
-            StylusCodec.messageType, action.rawValue, StylusCodec.sampleFormatXYP, UInt8(samples.count)
+            StylusCodec.messageType,
+            action.rawValue,
+            StylusCodec.sampleFormatXYPFlags,
+            flags,
+            UInt8(samples.count)
         ]
         for sample in samples {
             for value in [sample.x, sample.y, sample.pressure] {
@@ -28,7 +32,7 @@ final class StylusCodecTests: XCTestCase {
     /// asserts the same bytes for the same input — if one side drifts, both fail.
     func testGoldenBytes() {
         let golden: [UInt8] = [
-            0x0C, 0x01, 0x01, 0x02,
+            0x0C, 0x01, 0x02, 0x00, 0x02,
             0x40, 0x00, 0xBF, 0xFF, 0xFF, 0xFF,
             0x00, 0x00, 0xFF, 0xFF, 0x20, 0x00
         ]
@@ -56,7 +60,7 @@ final class StylusCodecTests: XCTestCase {
     /// touching, which is a measurement, not an absent value.
     func testGoldenHoverBytes() throws {
         let golden: [UInt8] = [
-            0x0C, 0x04, 0x01, 0x01,
+            0x0C, 0x04, 0x02, 0x00, 0x01,
             0x40, 0x00, 0xBF, 0xFF, 0x00, 0x00
         ]
         XCTAssertEqual(Array(encode(.hover, [StylusSample(x: 0.25, y: 0.75, pressure: 0)])), golden)
@@ -100,7 +104,7 @@ final class StylusCodecTests: XCTestCase {
     func testRoundTripsSingleSampleDown() throws {
         let sample = StylusSample(x: 0.4, y: 0.6, pressure: 0.2)
         let data = encode(.down, [sample])
-        XCTAssertEqual(data.count, 10)
+        XCTAssertEqual(data.count, 11)
         let message = try XCTUnwrap(StylusCodec.decode(data))
         XCTAssertEqual(message.action, .down)
         XCTAssertEqual(message.samples.count, 1)
@@ -114,7 +118,7 @@ final class StylusCodecTests: XCTestCase {
             StylusSample(x: Double($0) / 100, y: 1 - Double($0) / 100, pressure: Double($0) / 64)
         }
         let data = encode(.move, samples)
-        XCTAssertEqual(data.count, 388)
+        XCTAssertEqual(data.count, 389)
         let message = try XCTUnwrap(StylusCodec.decode(data))
         XCTAssertEqual(message.samples.count, 64)
         for (expected, actual) in zip(samples, message.samples) {
@@ -162,7 +166,7 @@ final class StylusCodecTests: XCTestCase {
     func testRoundTripsBatchedHoverMove() throws {
         let samples = (0..<5).map { StylusSample(x: Double($0) / 10, y: 1 - Double($0) / 10, pressure: 0) }
         let data = encode(.hover, samples)
-        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 34))
+        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 35))
         let message = try XCTUnwrap(StylusCodec.decode(data))
         XCTAssertEqual(message.action, .hover)
         for (expected, actual) in zip(samples, message.samples) {
@@ -193,7 +197,7 @@ final class StylusCodecTests: XCTestCase {
     }
 
     func testRejectsZeroSampleCount() {
-        XCTAssertNil(StylusCodec.decode(Data([0x0C, 0x01, 0x01, 0x00])))
+        XCTAssertNil(StylusCodec.decode(Data([0x0C, 0x01, 0x02, 0x00, 0x00])))
     }
 
     func testRejectsSampleCountAboveMax() {
@@ -240,11 +244,11 @@ final class StylusCodecTests: XCTestCase {
             StylusSample(x: 0.4, y: 0.5, pressure: 0.6),
             StylusSample(x: 0.7, y: 0.8, pressure: 0.9)
         ])
-        XCTAssertEqual(data.count, 22)
+        XCTAssertEqual(data.count, 23)
         for prefix in 0..<data.count {
             XCTAssertEqual(StylusCodec.frame(data.prefix(prefix)), .incomplete, "prefix of \(prefix) bytes")
         }
-        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 22))
+        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 23))
     }
 
     /// A coalesced read must yield the stylus frame's length exactly, leaving the
@@ -252,9 +256,9 @@ final class StylusCodecTests: XCTestCase {
     func testFramingLeavesTrailingPingUnconsumed() {
         let samples = (0..<5).map { StylusSample(x: Double($0) / 10, y: 0.5, pressure: 0.5) }
         var data = encode(.move, samples)
-        XCTAssertEqual(data.count, 34)
+        XCTAssertEqual(data.count, 35)
         data.append(4)  // WireMessage.ping
-        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 34))
+        XCTAssertEqual(StylusCodec.frame(data), .complete(length: 35))
     }
 
     func testFramingRejectsZeroCountDistinctFromIncomplete() {
@@ -263,13 +267,15 @@ final class StylusCodecTests: XCTestCase {
 
     func testFramingRejectsCountAboveMax() {
         XCTAssertEqual(StylusCodec.frame(Data([0x0C, 0x01, 0x01, 65])), .invalidHeader)
-        XCTAssertEqual(StylusCodec.frame(Data([0x0C, 0x01, 0x01, 0xFF])), .invalidHeader)
+        XCTAssertEqual(StylusCodec.frame(Data([0x0C, 0x01, 0x02, 0x00, 0xFF])), .invalidHeader)
     }
 
     func testFramingRejectsWrongTypeOrFormat() {
-        XCTAssertEqual(StylusCodec.frame(Data([0x02, 0x01, 0x01, 0x01])), .invalidHeader)
+        XCTAssertEqual(StylusCodec.frame(Data([0x02, 0x01, 0x02, 0x00, 0x01])), .invalidHeader)
         XCTAssertEqual(StylusCodec.frame(Data([0x02])), .invalidHeader)
-        XCTAssertEqual(StylusCodec.frame(Data([0x0C, 0x01, 0x02, 0x01])), .invalidHeader)
+        // Format 1 is the pre-flags layout: announced, and therefore rejected
+        // rather than silently reinterpreted with the wrong header size.
+        XCTAssertEqual(StylusCodec.frame(Data([0x0C, 0x01, 0x01, 0x00, 0x01])), .invalidHeader)
     }
 
     func testFramingOnEmptyBufferIsIncomplete() {
@@ -279,9 +285,9 @@ final class StylusCodecTests: XCTestCase {
     /// An unknown action is a decode rejection, not a framing one — the frame is
     /// still consumed whole, so the messages behind it stay aligned.
     func testFramingAcceptsUnknownActionSoTheFrameIsConsumed() {
-        var bytes: [UInt8] = [0x0C, 0x07, 0x01, 1]
+        var bytes: [UInt8] = [0x0C, 0x07, 0x02, 0x00, 1]
         bytes.append(contentsOf: [UInt8](repeating: 0, count: 6))
-        XCTAssertEqual(StylusCodec.frame(Data(bytes)), .complete(length: 10))
+        XCTAssertEqual(StylusCodec.frame(Data(bytes)), .complete(length: 11))
         XCTAssertNil(StylusCodec.decode(Data(bytes)))
     }
 }

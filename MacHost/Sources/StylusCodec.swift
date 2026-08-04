@@ -32,6 +32,21 @@ struct StylusSample: Equatable {
 struct StylusMessage: Equatable {
     let action: StylusAction
     let samples: [StylusSample]
+    /// Resolved intent, not the physical signal behind it. The client owns the
+    /// trigger-to-action binding because which signal a pen emits is a device
+    /// property it can observe; the host only decides what these mean on macOS.
+    let isSecondary: Bool
+    let isEraser: Bool
+
+    init(action: StylusAction,
+         samples: [StylusSample],
+         isSecondary: Bool = false,
+         isEraser: Bool = false) {
+        self.action = action
+        self.samples = samples
+        self.isSecondary = isSecondary
+        self.isEraser = isEraser
+    }
 }
 
 /// Outcome of looking at the head of the input buffer.
@@ -49,10 +64,11 @@ enum StylusFraming: Equatable {
 ///
 /// Layout, plain big-endian binary:
 ///   [0] message type (12)
-///   [1] action (0 down, 1 move, 2 up, 3 cancel, 4 hover enter, 5 hover move, 6 hover exit)
-///   [2] sample format (1 = x, y, pressure)
-///   [3] sample count, 1...64
-///   [4...] 6 bytes per sample: x uint16, y uint16, pressure uint16
+///   [1] action (0 down, 1 move, 2 up, 3 cancel, 4 hover)
+///   [2] sample format (2 = flags byte + x, y, pressure samples)
+///   [3] flags: bit 0 secondary contact, bit 1 eraser
+///   [4] sample count, 1...64
+///   [5...] 6 bytes per sample: x uint16, y uint16, pressure uint16
 ///
 /// The six-byte sample stride is fixed. Any additional per-sample axis needs its
 /// own message type with its own capability signal, not an extension of this one.
@@ -60,8 +76,15 @@ enum StylusFraming: Equatable {
 /// same layout and both sides carry golden-byte tests against it.
 enum StylusCodec {
     static let messageType: UInt8 = 12
-    static let sampleFormatXYP: UInt8 = 1
-    static let headerSize = 4
+    /// Format 2 replaced format 1 by adding the flags byte. The format value
+    /// exists so a layout change is announced rather than silently reinterpreted.
+    static let sampleFormatXYPFlags: UInt8 = 2
+    static let headerSize = 5
+
+    /// This contact is a secondary (right) click.
+    static let flagSecondary: UInt8 = 1
+    /// This contact is the eraser; the host announces an eraser pointer type.
+    static let flagEraser: UInt8 = 2
     static let sampleStride = 6
     static let maxSamples = 64
 
@@ -81,9 +104,9 @@ enum StylusCodec {
     static func frame(_ data: Data) -> StylusFraming {
         let bytes = [UInt8](data)
         if let type = bytes.first, type != messageType { return .invalidHeader }
-        if bytes.count >= 3, bytes[2] != sampleFormatXYP { return .invalidHeader }
-        if bytes.count >= 4 {
-            let count = Int(bytes[3])
+        if bytes.count >= 3, bytes[2] != sampleFormatXYPFlags { return .invalidHeader }
+        if bytes.count >= headerSize {
+            let count = Int(bytes[4])
             guard count >= 1 && count <= maxSamples else { return .invalidHeader }
             let total = headerSize + count * sampleStride
             return bytes.count >= total ? .complete(length: total) : .incomplete
@@ -105,9 +128,10 @@ enum StylusCodec {
         let bytes = [UInt8](data)
         guard bytes.count >= headerSize else { return nil }
         guard bytes[0] == messageType else { return nil }
-        guard bytes[2] == sampleFormatXYP else { return nil }
+        guard bytes[2] == sampleFormatXYPFlags else { return nil }
         guard let action = StylusAction(rawValue: bytes[1]) else { return nil }
-        let count = Int(bytes[3])
+        let flags = bytes[3]
+        let count = Int(bytes[4])
         guard count >= 1 && count <= maxSamples else { return nil }
         guard bytes.count == headerSize + count * sampleStride else { return nil }
 
@@ -121,7 +145,10 @@ enum StylusCodec {
                 pressure: unit(bytes[base + 4], bytes[base + 5])
             ))
         }
-        return StylusMessage(action: action, samples: samples)
+        return StylusMessage(action: action,
+                             samples: samples,
+                             isSecondary: flags & flagSecondary != 0,
+                             isEraser: flags & flagEraser != 0)
     }
 
     private static func unit(_ hi: UInt8, _ lo: UInt8) -> Double {

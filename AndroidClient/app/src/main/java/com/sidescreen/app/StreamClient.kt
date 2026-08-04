@@ -433,9 +433,10 @@ class StreamClient(
     fun sendStylus(
         action: StylusWire.Action,
         samples: List<StylusWire.Sample>,
+        flags: Int = 0,
     ) {
         if (!isConnected || !stylusSupported || samples.isEmpty()) return
-        val payload = StylusWire.encode(action, samples)
+        val payload = StylusWire.encode(action, samples, flags)
         touchScope.launch {
             try {
                 socket?.getOutputStream()?.let { out ->

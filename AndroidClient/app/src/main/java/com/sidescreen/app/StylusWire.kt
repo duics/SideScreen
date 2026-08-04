@@ -5,10 +5,16 @@ package com.sidescreen.app
  *
  * Layout, plain big-endian binary:
  *   [0] message type (12)
- *   [1] action (0 down, 1 move, 2 up, 3 cancel, 4 hover enter, 5 hover move, 6 hover exit)
- *   [2] sample format (1 = x, y, pressure)
- *   [3] sample count, 1..64
- *   [4...] 6 bytes per sample: x uint16, y uint16, pressure uint16
+ *   [1] action (0 down, 1 move, 2 up, 3 cancel, 4 hover)
+ *   [2] sample format (2 = flags byte + x, y, pressure samples)
+ *   [3] flags: bit 0 secondary contact, bit 1 eraser
+ *   [4] sample count, 1..64
+ *   [5...] 6 bytes per sample: x uint16, y uint16, pressure uint16
+ *
+ * The flags carry *resolved intent*, not the physical signal that produced it.
+ * Which trigger means what is a device property the client can observe and the
+ * user binds, so the host never has to know a barrel button from an eraser tip —
+ * it only has to know what a secondary contact does on macOS.
  *
  * The six-byte sample stride is fixed. Any additional per-sample axis (tilt,
  * orientation, hover distance) needs its own message type with its own
@@ -17,13 +23,25 @@ package com.sidescreen.app
  */
 object StylusWire {
     const val MESSAGE_TYPE = 12
-    const val SAMPLE_FORMAT_XYP = 1
-    const val HEADER_SIZE = 4
+
+    /**
+     * Format 2 replaced format 1 by adding the flags byte. The format value exists
+     * precisely so a layout change is announced rather than silently reinterpreted,
+     * so the header grew a version rather than a meaning.
+     */
+    const val SAMPLE_FORMAT_XYP_FLAGS = 2
+    const val HEADER_SIZE = 5
     const val SAMPLE_SIZE = 6
     const val MAX_SAMPLES = 64
 
     /** Full scale of a quantized unit field. Pressure of 1.0 encodes to this. */
     const val UNIT_SCALE = 65535
+
+    /** This contact is a secondary (right) click rather than a primary one. */
+    const val FLAG_SECONDARY = 1
+
+    /** This contact is the eraser. The host announces it as an eraser pointer. */
+    const val FLAG_ERASER = 2
 
     /**
      * The four contact actions are the core plan's and their codes are frozen —
@@ -84,6 +102,7 @@ object StylusWire {
     fun encode(
         action: Action,
         samples: List<Sample>,
+        flags: Int = 0,
     ): ByteArray {
         require(samples.size in 1..MAX_SAMPLES) {
             "sample count must be 1..$MAX_SAMPLES, got ${samples.size}"
@@ -91,8 +110,9 @@ object StylusWire {
         val out = ByteArray(HEADER_SIZE + samples.size * SAMPLE_SIZE)
         out[0] = MESSAGE_TYPE.toByte()
         out[1] = action.code.toByte()
-        out[2] = SAMPLE_FORMAT_XYP.toByte()
-        out[3] = samples.size.toByte()
+        out[2] = SAMPLE_FORMAT_XYP_FLAGS.toByte()
+        out[3] = flags.toByte()
+        out[4] = samples.size.toByte()
         var offset = HEADER_SIZE
         for (sample in samples) {
             offset = putUInt16(out, offset, quantizeUnit(sample.x))

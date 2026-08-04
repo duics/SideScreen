@@ -15,16 +15,78 @@ final class StylusInjectorTests: XCTestCase {
 
     private let bounds = CGRect(x: 100, y: 200, width: 1000, height: 800)
 
-    private func capture(_ steps: [StylusStep]) -> [CGEvent] {
+    private func capture(_ steps: [StylusStep],
+                         secondary: Bool = false,
+                         eraser: Bool = false) -> [CGEvent] {
         var posted: [CGEvent] = []
         let injector = StylusInjector(eventSource: CGEventSource(stateID: .hidSystemState),
                                       post: { posted.append($0) })
-        injector.perform(steps, in: bounds, cancelHostGesture: {}, armStaleTimeout: { _ in })
+        injector.perform(steps,
+                         in: bounds,
+                         secondary: secondary,
+                         eraser: eraser,
+                         cancelHostGesture: {},
+                         armStaleTimeout: { _ in })
         return posted
     }
 
     private func sample(_ x: Double, _ y: Double, _ pressure: Double) -> StylusSample {
         StylusSample(x: x, y: y, pressure: pressure)
+    }
+
+    // MARK: - Secondary click and eraser
+
+    /// A secondary contact posts real right-button events. Control-clicking is a
+    /// legacy synonym some apps handle inconsistently, and the event helpers
+    /// already take a button.
+    func testASecondaryContactPostsRightButtonEvents() {
+        let posted = capture([
+            .mouseDown(sample(0.5, 0.5, 0.5), clickCount: 1),
+            .mouseDragged(sample(0.6, 0.5, 0.5)),
+            .mouseUp(sample(0.6, 0.5, 0), clickCount: 1)
+        ], secondary: true)
+
+        XCTAssertEqual(posted.map { $0.type }, [.rightMouseDown, .rightMouseDragged, .rightMouseUp])
+        // Still a tablet event: a right click from the pen is a pen event.
+        XCTAssertEqual(posted.first?.getIntegerValueField(.mouseEventSubtype),
+                       StylusInjector.tabletPointSubtype)
+    }
+
+    /// The press and its release must agree on which button they are, which is
+    /// why the contact kind is passed once for the whole step list rather than
+    /// carried on each step — the same reasoning behind deciding click count once.
+    func testAPressAndItsReleaseAgreeOnTheButton() {
+        let posted = capture([
+            .mouseDown(sample(0.5, 0.5, 0.5), clickCount: 2),
+            .mouseUp(sample(0.5, 0.5, 0), clickCount: 2)
+        ], secondary: true)
+        XCTAssertEqual(posted.map { $0.type }, [.rightMouseDown, .rightMouseUp])
+        XCTAssertEqual(posted.map { $0.getIntegerValueField(.mouseEventClickState) }, [2, 2])
+    }
+
+    /// The eraser is announced as a pointer type on the proximity event, not
+    /// mapped to a click: this is the mechanism drawing apps watch to switch to
+    /// their eraser tool, and Side Screen has no canvas of its own to erase on.
+    func testEraserIsAnnouncedAsAPointerTypeOnProximity() {
+        let asPen = capture([.proximityEnter])
+        XCTAssertEqual(asPen.first?.getIntegerValueField(.tabletProximityEventPointerType),
+                       StylusInjector.penPointerType)
+
+        let asEraser = capture([.proximityEnter], eraser: true)
+        XCTAssertEqual(asEraser.first?.getIntegerValueField(.tabletProximityEventPointerType),
+                       StylusInjector.eraserPointerType)
+        XCTAssertEqual(asEraser.first?.getIntegerValueField(.tabletProximityEventVendorPointerType),
+                       StylusInjector.vendorPointerTypeEraser)
+        // Still the same device: an app matches a stroke to the pen that entered.
+        XCTAssertEqual(asEraser.first?.getIntegerValueField(.tabletProximityEventDeviceID),
+                       StylusInjector.deviceID)
+    }
+
+    /// An eraser still draws with the left button — it is a tool change, not a
+    /// different click.
+    func testAnEraserContactStillUsesThePrimaryButton() {
+        let posted = capture([.mouseDown(sample(0.5, 0.5, 0.5), clickCount: 1)], eraser: true)
+        XCTAssertEqual(posted.first?.type, .leftMouseDown)
     }
 
     // MARK: - R10, KTD12: pressure on both fields

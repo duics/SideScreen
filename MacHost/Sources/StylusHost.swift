@@ -77,8 +77,11 @@ final class StylusHost {
         guard let bounds = resolveBounds() else { return }
         perform(planner.plan(message,
                              displaySize: bounds.size,
-                             fingerButtonHeld: fingerButtonHeld()),
-                in: bounds)
+                             fingerButtonHeld: fingerButtonHeld(),
+                             isEraser: message.isEraser),
+                in: bounds,
+                secondary: message.isSecondary,
+                eraser: message.isEraser)
     }
 
     /// R3/KTD4. True when a finger event arrived while the pen owns the surface
@@ -112,7 +115,10 @@ final class StylusHost {
 
     /// Every stylus step list — messages, the staleness timer, and all the
     /// teardown paths — is performed here.
-    private func perform(_ steps: [StylusStep], in bounds: CGRect) {
+    private func perform(_ steps: [StylusStep],
+                         in bounds: CGRect,
+                         secondary: Bool = false,
+                         eraser: Bool = false) {
         guard !steps.isEmpty else { return }
         // Proximity as well as contact: a pen that is merely hovering when the
         // display goes away still owes the session a proximity exit, and the
@@ -126,6 +132,8 @@ final class StylusHost {
 
         injector.perform(steps,
                          in: bounds,
+                         secondary: secondary,
+                         eraser: eraser,
                          cancelHostGesture: cancelHostGesture,
                          armStaleTimeout: { [weak self] delay in
                              self?.armStaleTimer(after: delay)

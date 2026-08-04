@@ -1386,7 +1386,7 @@ class MainActivity : AppCompatActivity() {
         val pointerCount = event.pointerCount
         var hasStylus = false
         for (i in 0 until pointerCount) {
-            if (StylusInput.toolFor(event.getToolType(i)) == StylusInput.Tool.STYLUS) {
+            if (StylusInput.toolFor(event.getToolType(i)).isStylus) {
                 hasStylus = true
                 break
             }
@@ -1400,7 +1400,7 @@ class MainActivity : AppCompatActivity() {
         val pointers = ArrayList<StylusInput.Pointer>(pointerCount)
         for (i in 0 until pointerCount) {
             val tool = StylusInput.toolFor(event.getToolType(i))
-            val isStylus = tool == StylusInput.Tool.STYLUS
+            val isStylus = tool.isStylus
             // R6. Only the stylus needs its history; a finger's samples are dropped anyway.
             val history =
                 if (isStylus && historySize > 0) {
@@ -1445,11 +1445,13 @@ class MainActivity : AppCompatActivity() {
                     // explicitly reports no pressure axis gets full scale substituted.
                     hasPressureAxis = device == null || device.getMotionRange(MotionEvent.AXIS_PRESSURE) != null,
                     eventTimeMs = event.eventTime,
+                    barrelButtonHeld =
+                        event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0,
                 ),
             )
 
         for (send in decision.sends) {
-            client.sendStylus(send.action, send.samples)
+            client.sendStylus(send.action, send.samples, send.flags)
         }
         return decision.handled
     }
@@ -1516,7 +1518,7 @@ class MainActivity : AppCompatActivity() {
             )
 
         for (send in decision.sends) {
-            client.sendStylus(send.action, send.samples)
+            client.sendStylus(send.action, send.samples, send.flags)
         }
         return decision.handled
     }

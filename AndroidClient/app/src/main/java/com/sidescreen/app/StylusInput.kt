@@ -47,10 +47,49 @@ package com.sidescreen.app
  *   refreshes it several hundred times a second.
  */
 class StylusInput {
-    /** Tool that produced a pointer. Eraser counts as a stylus — see [Companion.toolFor]. */
+    /**
+     * Tool that produced a pointer.
+     *
+     * [ERASER] is a stylus for every routing decision — it draws, it suppresses
+     * palms, it is not a finger — and differs only in being a bindable trigger.
+     * Use [isStylus] rather than comparing to [STYLUS], or an eraser-reporting pen
+     * silently routes to the finger path.
+     */
     enum class Tool {
         STYLUS,
+        ERASER,
         FINGER,
+        ;
+
+        val isStylus: Boolean
+            get() = this == STYLUS || this == ERASER
+    }
+
+    /**
+     * A physical signal the pen can produce, which the user binds to an action.
+     *
+     * Triggers are *discovered* rather than declared: the client reports the ones
+     * it has actually seen this device emit, so hardware nobody has tested is
+     * bindable without a device table. The Tab S9's pen, for instance, reports no
+     * eraser tool on either end, so its only trigger is the barrel button.
+     */
+    enum class Trigger {
+        BARREL_BUTTON,
+        ERASER_TOOL,
+    }
+
+    /** What a bound trigger makes a contact mean. */
+    enum class PenAction {
+        SECONDARY_CLICK,
+        ERASER,
+        ;
+
+        val flag: Int
+            get() =
+                when (this) {
+                    SECONDARY_CLICK -> StylusWire.FLAG_SECONDARY
+                    ERASER -> StylusWire.FLAG_ERASER
+                }
     }
 
     /** The `actionMasked` values this path cares about. Anything else never reaches the core. */
@@ -107,6 +146,8 @@ class StylusInput {
         val canceled: Boolean = false,
         val hasPressureAxis: Boolean = true,
         val eventTimeMs: Long = 0L,
+        /** `MotionEvent.BUTTON_STYLUS_PRIMARY` is set in `buttonState`. */
+        val barrelButtonHeld: Boolean = false,
     )
 
     /**
@@ -136,6 +177,8 @@ class StylusInput {
     data class Send(
         val action: StylusWire.Action,
         val samples: List<StylusWire.Sample>,
+        /** Resolved intent for this contact — see [StylusWire.FLAG_SECONDARY]. */
+        val flags: Int = 0,
     )
 
     /**
@@ -159,6 +202,30 @@ class StylusInput {
     private var lastHoverMs: Long? = null
     private var lastSample = StylusWire.Sample(0f, 0f, 0f)
     private var hoverEnabled = true
+
+    /**
+     * Which trigger means what. Keyed by trigger, which is what makes the "a
+     * button cannot be mapped twice" rule structural rather than a validation
+     * step: a map cannot hold one key twice, so binding a trigger that is already
+     * bound moves it instead of duplicating it.
+     */
+    private val bindings = mutableMapOf<Trigger, PenAction>()
+
+    /**
+     * Triggers this device has actually been seen to emit, so the settings UI can
+     * offer what exists rather than what the spec sheet claims. The Tab S9's pen
+     * reports no eraser tool at all, so [Trigger.ERASER_TOOL] never appears here
+     * on that hardware however hard the user flips it.
+     */
+    private val observedTriggers = mutableSetOf<Trigger>()
+
+    /**
+     * Flags for the contact currently open, decided when it opened and carried to
+     * its release — the same rule click count follows. A button pressed halfway
+     * through a stroke must not turn that stroke into a right-drag under the
+     * app's feet.
+     */
+    private var strokeFlags = 0
 
     /**
      * True while this path owns the *touch* stream — a stroke is open, or fingers
@@ -207,6 +274,65 @@ class StylusInput {
         return elapsed >= 0 && elapsed < PROXIMITY_WINDOW_MS
     }
 
+    /** Triggers this device has been seen to emit. Empty until the pen produces one. */
+    fun triggersSeen(): Set<Trigger> = observedTriggers.toSet()
+
+    /** The trigger currently bound to [action], or null. */
+    fun triggerFor(action: PenAction): Trigger? = bindings.entries.firstOrNull { it.value == action }?.key
+
+    /**
+     * Bind [trigger] to [action], moving it off whatever it was bound to before.
+     * Also clears any other trigger already bound to [action], so the relationship
+     * stays one to one in both directions and a user cannot end up with two ways
+     * to right click and no way to erase.
+     */
+    fun bind(
+        trigger: Trigger,
+        action: PenAction,
+    ) {
+        bindings.entries.removeAll { it.value == action }
+        bindings[trigger] = action
+    }
+
+    /** Unbind whatever is bound to [action]. */
+    fun unbind(action: PenAction) {
+        bindings.entries.removeAll { it.value == action }
+    }
+
+    /** Replace the whole mapping, for restoring persisted settings at startup. */
+    fun restoreBindings(map: Map<Trigger, PenAction>) {
+        bindings.clear()
+        for ((trigger, action) in map) bind(trigger, action)
+    }
+
+    /** The current mapping, for persisting it. */
+    fun currentBindings(): Map<Trigger, PenAction> = bindings.toMap()
+
+    /**
+     * The triggers active for this event, whether or not they are bound. The
+     * settings UI listens through this: a press-to-bind row takes the first one
+     * reported and binds it, so a signal nobody anticipated is still bindable.
+     */
+    fun activeTriggers(
+        frame: Frame,
+        actor: Pointer?,
+    ): Set<Trigger> {
+        val active = mutableSetOf<Trigger>()
+        if (frame.barrelButtonHeld) active.add(Trigger.BARREL_BUTTON)
+        if (actor?.tool == Tool.ERASER) active.add(Trigger.ERASER_TOOL)
+        observedTriggers.addAll(active)
+        return active
+    }
+
+    /** The wire flags the active triggers resolve to, per the current bindings. */
+    private fun flagsFor(
+        frame: Frame,
+        actor: Pointer?,
+    ): Int =
+        activeTriggers(frame, actor).fold(0) { acc, trigger ->
+            acc or (bindings[trigger]?.flag ?: 0)
+        }
+
     /** R8. False while hover forwarding is turned off. */
     val isHoverEnabled: Boolean
         get() = hoverEnabled
@@ -217,6 +343,7 @@ class StylusInput {
         suppressed.clear()
         lastStylusEventMs = 0L
         lastHoverMs = null
+        strokeFlags = 0
     }
 
     /**
@@ -251,7 +378,7 @@ class StylusInput {
      */
     fun processHover(frame: HoverFrame): Decision {
         if (!hoverEnabled) return Decision(handled = false)
-        if (frame.tool != Tool.STYLUS) return Decision(handled = false)
+        if (!frame.tool.isStylus) return Decision(handled = false)
         // An exit is consumed because it is ours, and otherwise ignored. Acting on
         // it would reintroduce the dependency this design removes, and it is wrong
         // even when it arrives: Android emits an exit as the nib reaches the glass,
@@ -262,7 +389,14 @@ class StylusInput {
 
         lastHoverMs = frame.eventTimeMs
         val at = hoverSample(frame.point.x, frame.point.y)
-        return Decision(handled = true, sends = listOf(Send(StylusWire.Action.HOVER, listOf(at))))
+        // A hover sample is not a contact, so it reports the trigger state live
+        // rather than a frozen one: that is how a hovering eraser announces its
+        // pointer type to the host before it ever touches down.
+        val hoverTriggers = mutableSetOf<Trigger>()
+        if (frame.tool == Tool.ERASER) hoverTriggers.add(Trigger.ERASER_TOOL)
+        observedTriggers.addAll(hoverTriggers)
+        val flags = hoverTriggers.fold(0) { acc, t -> acc or (bindings[t]?.flag ?: 0) }
+        return Decision(handled = true, sends = listOf(Send(StylusWire.Action.HOVER, listOf(at), flags)))
     }
 
     /** A hover position. Pressure is a real zero — the pen is not touching (R12). */
@@ -314,11 +448,14 @@ class StylusInput {
         actor: Pointer?,
         sends: MutableList<Send>,
     ): Decision {
-        if (actor != null && actor.tool == Tool.STYLUS) {
+        if (actor != null && actor.tool.isStylus) {
             if (strokePointerId != actor.id) {
                 closeStroke(sends, StylusWire.Action.CANCEL, lastSample)
             }
             strokePointerId = actor.id
+            // Decided once, here. A button pressed halfway through a stroke must
+            // not turn it into a right-drag under the app's feet.
+            strokeFlags = flagsFor(frame, actor)
             lastStylusEventMs = frame.eventTimeMs
             // A pen on the glass is a pen in range: contact keeps the proximity bound
             // fresh, so the hover silence a stroke necessarily causes cannot expire it.
@@ -352,7 +489,7 @@ class StylusInput {
             // host drop it anyway) and, crucially, never handed to the gesture path:
             // under KD2 the pen is not a gesture pointer. Suppressed fingers keep
             // producing moves the host must never see either.
-            val hasStylus = frame.pointers.any { it.tool == Tool.STYLUS }
+            val hasStylus = frame.pointers.any { it.tool.isStylus }
             return Decision(handled = hasStylus || suppressed.isNotEmpty(), sends = sends)
         }
         val stylus = frame.pointers.firstOrNull { it.id == strokeId }
@@ -389,7 +526,7 @@ class StylusInput {
         val wasSuppressed = suppressed.remove(frame.actionPointerId)
         // A stylus lifting with no matching stroke is swallowed, not passed to the
         // gesture path — the pen is never a gesture pointer once the host can take it.
-        val handled = wasSuppressed || ownsTouchStream || actor?.tool == Tool.STYLUS
+        val handled = wasSuppressed || ownsTouchStream || actor?.tool?.isStylus == true
         // ACTION_UP is the last pointer leaving the glass; nothing can still be suppressed.
         if (frame.action == Action.UP) suppressed.clear()
         return Decision(handled = handled, sends = sends)
@@ -417,11 +554,12 @@ class StylusInput {
         if (strokePointerId == null) return
         strokePointerId = null
         emit(sends, action, listOf(sample))
+        strokeFlags = 0
     }
 
     private fun suppressFingers(frame: Frame) {
         for (pointer in frame.pointers) {
-            if (pointer.tool != Tool.STYLUS) suppressed.add(pointer.id)
+            if (!pointer.tool.isStylus) suppressed.add(pointer.id)
         }
     }
 
@@ -467,6 +605,7 @@ class StylusInput {
                 Send(
                     if (isLast) action else StylusWire.Action.MOVE,
                     samples.subList(start, end).toList(),
+                    strokeFlags,
                 ),
             )
             start = end
@@ -519,6 +658,10 @@ class StylusInput {
          * bug. No eraser *semantics* are implied — the host sees an ordinary stroke.
          */
         fun toolFor(toolType: Int): Tool =
-            if (toolType == TOOL_TYPE_STYLUS || toolType == TOOL_TYPE_ERASER) Tool.STYLUS else Tool.FINGER
+            when (toolType) {
+                TOOL_TYPE_STYLUS -> Tool.STYLUS
+                TOOL_TYPE_ERASER -> Tool.ERASER
+                else -> Tool.FINGER
+            }
     }
 }

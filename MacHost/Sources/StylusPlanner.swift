@@ -127,6 +127,9 @@ final class StylusPlanner {
     /// When the last hover sample arrived. Proximity is derived from this rather
     /// than latched — see `staleTimeoutFired`.
     private var lastHoverTime: TimeInterval = 0
+    /// Which pointer type the host has most recently announced. Tracked so a
+    /// change can re-announce proximity; see `plan`.
+    private var isEraserPointer = false
 
     /// R26. Decided once, when the stroke opens, and carried to the release, so
     /// press and release always agree.
@@ -156,7 +159,32 @@ final class StylusPlanner {
     func plan(_ message: StylusMessage,
               displaySize: CGSize,
               fingerButtonHeld: Bool = false,
+              isEraser: Bool = false,
               now: TimeInterval = ProcessInfo.processInfo.systemUptime) -> [StylusStep] {
+        // Pointer type is announced on the proximity event, so changing between
+        // pen and eraser mid-session has to re-announce it — an app that switched
+        // to its eraser tool has no other signal telling it to switch back. The
+        // exit/enter pair is the announcement; the injector stamps the new type on
+        // the enter because it is told the contact kind alongside these steps.
+        var steps: [StylusStep] = []
+        if isEraser != isEraserPointer {
+            isEraserPointer = isEraser
+            if inProximity {
+                steps.append(.proximityExit)
+                inProximity = false
+            }
+        }
+        steps.append(contentsOf: planAction(message,
+                                            displaySize: displaySize,
+                                            fingerButtonHeld: fingerButtonHeld,
+                                            now: now))
+        return steps
+    }
+
+    private func planAction(_ message: StylusMessage,
+                            displaySize: CGSize,
+                            fingerButtonHeld: Bool,
+                            now: TimeInterval) -> [StylusStep] {
         switch message.action {
         case .down:
             return planDown(message.samples, displaySize: displaySize, now: now)
