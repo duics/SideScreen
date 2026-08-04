@@ -43,6 +43,14 @@ import java.net.Socket
 
 private fun mainDiag(msg: String) = DiagLog.log("MA", msg)
 
+/**
+ * How long a settings row waits for a pen press before saying it saw nothing.
+ *
+ * Long enough to pick the pen up, short enough that a button One UI has already
+ * claimed reads as "not detected" rather than as a hung dialog.
+ */
+private const val PEN_LISTEN_TIMEOUT_MS = 10_000L
+
 class MainActivity : AppCompatActivity() {
     private lateinit var wirelessController: WirelessTabController
     private val pairedHostStorage by lazy { PairedHostStorage(this) }
@@ -73,6 +81,24 @@ class MainActivity : AppCompatActivity() {
     // Stylus stroke state. Never consulted by the predictor: a stylus stroke carries
     // measured samples only (R5).
     private val stylusInput = StylusInput()
+
+    // Press-to-bind state for the pen rows in the settings dialog. It lives on the
+    // activity rather than in the dialog's closure because the capture hook is
+    // `dispatchGenericMotionEvent`, which the dialog cannot reach.
+    private var penListenAction: StylusInput.PenAction? = null
+
+    /** The row whose listen window expired, so it can say so instead of silently reverting. */
+    private var penListenFailed: StylusInput.PenAction? = null
+
+    /** Re-renders both pen rows. Non-null only while the settings dialog is showing. */
+    private var penRowRenderer: (() -> Unit)? = null
+    private val penListenHandler = Handler(Looper.getMainLooper())
+    private val penListenTimeout =
+        Runnable {
+            penListenFailed = penListenAction
+            penListenAction = null
+            penRowRenderer?.invoke()
+        }
 
     // Checklist status handler
     private val checklistHandler = Handler(Looper.getMainLooper())
@@ -369,6 +395,11 @@ class MainActivity : AppCompatActivity() {
         // R1. Hover arrives through `View.dispatchHoverEvent`, never the touch
         // listener, so it needs its own registration on the same two views.
         stylusInput.setHoverEnabled(prefs.stylusHoverEnabled)
+        // Nothing is bound out of the box, so this is a no-op until the user has
+        // assigned a trigger in settings. Restoring here keeps the core the single
+        // owner of the one-to-one rule — a hand-edited preferences file is normalized
+        // by `restoreBindings`, not validated a second time up here.
+        stylusInput.restoreBindings(prefs.penBindings)
         binding.surfaceView.setOnHoverListener { view, event -> handleStylusHover(view, event) }
         binding.textureView.setOnHoverListener { view, event -> handleStylusHover(view, event) }
     }
@@ -528,7 +559,15 @@ class MainActivity : AppCompatActivity() {
 
     @SuppressLint("InflateParams", "SetTextI18n")
     private fun showSettingsDialog() {
-        val dialog = Dialog(this)
+        // A dialog owns its own window, so pen events that land inside it are
+        // dispatched here and never reach the activity's `dispatchGenericMotionEvent`.
+        // Press-to-bind has to see them wherever the pen happens to be, so both hooks
+        // call the same capture.
+        val dialog =
+            object : Dialog(this) {
+                override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean =
+                    capturePenTrigger(ev) || super.dispatchGenericMotionEvent(ev)
+            }
         dialog.requestWindowFeature(Window.FEATURE_NO_TITLE)
         dialog.setContentView(R.layout.dialog_settings)
         dialog.window?.setBackgroundDrawable(ColorDrawable(Color.TRANSPARENT))
@@ -542,6 +581,13 @@ class MainActivity : AppCompatActivity() {
         val resetSettingsBtn = view.findViewById<View>(R.id.resetSettingsButton)
         val disconnectButton = view.findViewById<View>(R.id.disconnectSettingsButton)
         val closeButton = view.findViewById<View>(R.id.closeButton)
+        val penHoverSwitch = view.findViewById<SwitchMaterial>(R.id.penHoverSwitch)
+        val penSecondaryStatus = view.findViewById<TextView>(R.id.penSecondaryStatus)
+        val penSecondaryAssign = view.findViewById<MaterialButton>(R.id.penSecondaryAssign)
+        val penSecondaryClear = view.findViewById<MaterialButton>(R.id.penSecondaryClear)
+        val penEraserStatus = view.findViewById<TextView>(R.id.penEraserStatus)
+        val penEraserAssign = view.findViewById<MaterialButton>(R.id.penEraserAssign)
+        val penEraserClear = view.findViewById<MaterialButton>(R.id.penEraserClear)
 
         // Only show Disconnect when actually streaming. Otherwise the button is
         // a no-op and confuses users into clicking it twice.
@@ -560,6 +606,7 @@ class MainActivity : AppCompatActivity() {
         // Load current settings
         showStatsSwitch.isChecked = prefs.showStatsOverlay
         hideSettingsSwitch.isChecked = prefs.hideSettingsButton
+        penHoverSwitch.isChecked = prefs.stylusHoverEnabled
         opacitySlider.value = prefs.overlayOpacity
         opacityValue.text = "${(prefs.overlayOpacity * 100).toInt()}%"
 
@@ -590,6 +637,40 @@ class MainActivity : AppCompatActivity() {
         }
         updatePositionSelection(prefs.settingsButtonCorner)
 
+        // Both pen rows are always rendered together, never just the one that changed:
+        // the binding core keeps triggers one-to-one, so assigning a trigger that was
+        // already bound to the other action MOVES it, and that row has to stop claiming
+        // a binding it no longer has.
+        fun renderPenRow(
+            action: StylusInput.PenAction,
+            status: TextView,
+            assign: MaterialButton,
+            clear: MaterialButton,
+        ) {
+            val listening = penListenAction == action
+            status.text = penRowStatus(action)
+            assign.text = if (listening) "Cancel" else "Assign"
+            clear.visibility =
+                if (!listening && stylusInput.triggerFor(action) != null) View.VISIBLE else View.GONE
+        }
+
+        fun renderPenRows() {
+            renderPenRow(
+                StylusInput.PenAction.SECONDARY_CLICK,
+                penSecondaryStatus,
+                penSecondaryAssign,
+                penSecondaryClear,
+            )
+            renderPenRow(
+                StylusInput.PenAction.ERASER,
+                penEraserStatus,
+                penEraserAssign,
+                penEraserClear,
+            )
+        }
+        penRowRenderer = { renderPenRows() }
+        renderPenRows()
+
         // Setup listeners
         showStatsSwitch.setOnCheckedChangeListener { _, isChecked ->
             prefs.showStatsOverlay = isChecked
@@ -609,6 +690,27 @@ class MainActivity : AppCompatActivity() {
                         android.widget.Toast.LENGTH_LONG,
                     ).show()
             }
+        }
+
+        // R8. The preference was already read at startup but had no control anywhere,
+        // so hover could not be turned off once it was on. The core is told directly as
+        // well as persisted, because it holds the flag for the running session.
+        penHoverSwitch.setOnCheckedChangeListener { _, isChecked ->
+            prefs.stylusHoverEnabled = isChecked
+            stylusInput.setHoverEnabled(isChecked)
+        }
+
+        penSecondaryAssign.setOnClickListener { togglePenListen(StylusInput.PenAction.SECONDARY_CLICK) }
+        penSecondaryClear.setOnClickListener { clearPenBinding(StylusInput.PenAction.SECONDARY_CLICK) }
+        penEraserAssign.setOnClickListener { togglePenListen(StylusInput.PenAction.ERASER) }
+        penEraserClear.setOnClickListener { clearPenBinding(StylusInput.PenAction.ERASER) }
+
+        // Closing the dialog is the third way out of listen mode, next to Cancel and the
+        // timeout. Leaving it armed would consume the next pen press over the stream.
+        dialog.setOnDismissListener {
+            stopPenListen()
+            penListenFailed = null
+            penRowRenderer = null
         }
 
         opacitySlider.addOnChangeListener { _, value, _ ->
@@ -702,6 +804,128 @@ class MainActivity : AppCompatActivity() {
             val maxH = (resources.displayMetrics.heightPixels * 0.85).toInt()
             win.setLayout(WindowManager.LayoutParams.MATCH_PARENT, maxH)
         }
+    }
+
+    // ==================== Pen trigger binding ====================
+
+    /**
+     * Press-to-bind's capture hook.
+     *
+     * A pen button press with the nib off the glass is a *generic* motion event, not a
+     * touch event: `View.dispatchPointerEvent` sends anything that is not a touch down /
+     * move / up down this path instead. Hover moves carrying `BUTTON_STYLUS_PRIMARY`
+     * and `ACTION_BUTTON_PRESS` both arrive here, and both are enough to identify the
+     * trigger, which is why the settings row can be bound without touching the screen.
+     *
+     * Consuming the event when it binds keeps the same press from also reaching the
+     * stylus path and being sent to the Mac as a right click.
+     */
+    override fun dispatchGenericMotionEvent(ev: MotionEvent): Boolean {
+        if (capturePenTrigger(ev)) return true
+        return super.dispatchGenericMotionEvent(ev)
+    }
+
+    /**
+     * Bind the first trigger this event carries to the listening row, if any row is
+     * listening. Returns true when the event was consumed.
+     *
+     * Detection is delegated to `StylusInput.activeTriggers`, not reimplemented here:
+     * that call is also what records the trigger as *seen*, so binding the barrel
+     * button teaches the core this device has one. No `process` call is made, so none
+     * of the stroke state is disturbed by a press that happens over the dialog.
+     */
+    private fun capturePenTrigger(event: MotionEvent): Boolean {
+        val action = penListenAction ?: return false
+        val index = event.actionIndex.coerceIn(0, (event.pointerCount - 1).coerceAtLeast(0))
+        val actor =
+            if (event.pointerCount > 0) {
+                StylusInput.Pointer(
+                    id = event.getPointerId(index),
+                    tool = StylusInput.toolFor(event.getToolType(index)),
+                    point = StylusInput.Point(0f, 0f, 0f),
+                )
+            } else {
+                null
+            }
+        val frame =
+            StylusInput.Frame(
+                action = StylusInput.Action.MOVE,
+                actionPointerId = actor?.id ?: 0,
+                pointers = listOfNotNull(actor),
+                eventTimeMs = event.eventTime,
+                barrelButtonHeld = event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0,
+            )
+        val trigger = stylusInput.activeTriggers(frame, actor).firstOrNull() ?: return false
+
+        stopPenListen()
+        penListenFailed = null
+        // The core owns the one-to-one rule: binding a trigger that was already bound
+        // to the other action MOVES it, which is why both rows are re-rendered below.
+        stylusInput.bind(trigger, action)
+        prefs.penBindings = stylusInput.currentBindings()
+        penRowRenderer?.invoke()
+        return true
+    }
+
+    /** Start listening for [action], or stop if that row is already listening (the Cancel case). */
+    private fun togglePenListen(action: StylusInput.PenAction) {
+        val alreadyListening = penListenAction == action
+        stopPenListen()
+        penListenFailed = null
+        if (!alreadyListening) {
+            penListenAction = action
+            // Bounded on purpose. One UI hands the barrel button to Air command when the
+            // user has bound it there, and no press ever reaches this app — a listen mode
+            // that waited forever would look like a frozen app rather than a device setting.
+            penListenHandler.postDelayed(penListenTimeout, PEN_LISTEN_TIMEOUT_MS)
+        }
+        penRowRenderer?.invoke()
+    }
+
+    private fun clearPenBinding(action: StylusInput.PenAction) {
+        // Only the row being cleared leaves listen mode. Clearing the *other* row
+        // used to cancel a live "press the button now" prompt with no explanation,
+        // which reads as the app ignoring the press the user was about to make.
+        if (penListenAction == action) stopPenListen()
+        if (penListenFailed == action) penListenFailed = null
+        stylusInput.unbind(action)
+        prefs.penBindings = stylusInput.currentBindings()
+        penRowRenderer?.invoke()
+    }
+
+    /** Leave listen mode without rendering; every caller decides what to show next. */
+    private fun stopPenListen() {
+        penListenAction = null
+        penListenHandler.removeCallbacks(penListenTimeout)
+    }
+
+    private fun penTriggerLabel(trigger: StylusInput.Trigger): String =
+        when (trigger) {
+            StylusInput.Trigger.BARREL_BUTTON -> "barrel button"
+            StylusInput.Trigger.ERASER_TOOL -> "eraser end"
+        }
+
+    /**
+     * What a pen row says right now.
+     *
+     * The "nothing seen yet" case is deliberately explicit. Triggers are discovered,
+     * never assumed: the Tab S9's pen reports no eraser tool at either end, so on that
+     * hardware `triggersSeen()` never contains one however hard the user flips the pen.
+     * Saying "not assigned" alone would read as "assign it", which is a promise this
+     * app cannot keep for a signal the device does not emit.
+     */
+    private fun penRowStatus(action: StylusInput.PenAction): String {
+        if (penListenAction == action) return "Hold the pen near the screen and press its button…"
+        if (penListenFailed == action) {
+            return "No press detected. Hold the pen close to the screen while pressing. " +
+                "Some devices also let One UI take the button for Air command."
+        }
+        val bound = stylusInput.triggerFor(action)
+        if (bound != null) return "Bound to the ${penTriggerLabel(bound)}"
+        if (stylusInput.triggersSeen().isEmpty()) {
+            return "Not assigned. This pen has not emitted a bindable signal yet."
+        }
+        return "Not assigned"
     }
 
     private fun updateSettingsButtonOpacity(opacity: Float) {
@@ -1514,6 +1738,8 @@ class MainActivity : AppCompatActivity() {
                         ),
                     distance = distance,
                     eventTimeMs = event.eventTime,
+                    barrelButtonHeld =
+                        event.buttonState and MotionEvent.BUTTON_STYLUS_PRIMARY != 0,
                 ),
             )
 
@@ -1640,6 +1866,8 @@ class MainActivity : AppCompatActivity() {
 
     override fun onDestroy() {
         super.onDestroy()
+        stopPenListen()
+        penRowRenderer = null
         stopChecklistUpdates()
         cleanup()
     }

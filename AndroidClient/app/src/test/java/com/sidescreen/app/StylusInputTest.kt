@@ -552,10 +552,9 @@ class StylusInputTest {
 
         for (action in StylusInput.HoverAction.values()) {
             val decision = core.processHover(hover(action))
-            assertFalse(decision.handled)
-            assertTrue(decision.sends.isEmpty())
+            assertTrue("the event is still ours", decision.handled)
+            assertTrue("but the cursor does not follow the pen", decision.sends.isEmpty())
         }
-        assertFalse(core.isInProximity(0))
 
         // AE4. Drawing is untouched: the stroke behaves exactly as the core plan's.
         val down = core.process(frame(StylusInput.Action.DOWN, 1, listOf(stylus())))
@@ -567,14 +566,21 @@ class StylusInputTest {
 
     /** Turning hover off mid-hover drops proximity immediately and sends nothing. */
     @Test
-    fun turningHoverOffWhileHoveringDropsProximity() {
+    fun turningHoverOffKeepsProximityAndSoKeepsPalmRejection() {
         val core = StylusInput()
         core.processHover(hover(StylusInput.HoverAction.ENTER, x = 0.4f, y = 0.6f, eventTimeMs = 4_000))
         assertTrue(core.isInProximity(4_000))
 
+        // The preference governs whether the Mac cursor follows the pen. It is not
+        // the palm-rejection switch, and a user turning it off for a cosmetic
+        // reason must not silently lose R9's pre-contact wrist suppression.
         core.setHoverEnabled(false)
-        assertFalse(core.isInProximity(4_000))
-        assertFalse(core.isActive(4_000))
+        assertTrue("proximity is tracked whether or not it is forwarded", core.isInProximity(4_000))
+        assertTrue(core.isActive(4_000))
+
+        val wrist = core.process(frame(StylusInput.Action.DOWN, 9, listOf(finger()), eventTimeMs = 4_010))
+        assertTrue("the wrist is still suppressed", wrist.handled)
+        assertTrue("but nothing is sent, because hover is off", wrist.sends.isEmpty())
     }
 
     /** Covers R2. Leaving range is consumed but forwards nothing — the window ends it. */
@@ -677,6 +683,46 @@ class StylusInputTest {
         core.reset()
         assertFalse(core.isInProximity(5))
         assertFalse(core.isActive(0))
+    }
+
+    /**
+     * How the barrel button is actually discovered. The contact path only sees it
+     * if the button happened to be held at touch-down; a user pressing it is
+     * normally hovering, so hover is where discovery has to happen or the settings
+     * UI reports "this pen has emitted no bindable signal" forever.
+     */
+    @Test
+    fun hoveringWithTheButtonHeldDiscoversTheBarrelButton() {
+        val core = StylusInput()
+        assertTrue(core.triggersSeen().isEmpty())
+
+        core.processHover(
+            StylusInput.HoverFrame(
+                StylusInput.HoverAction.MOVE,
+                StylusInput.Tool.STYLUS,
+                point(0.5f, 0.5f, 0f),
+                eventTimeMs = 100,
+                barrelButtonHeld = true,
+            ),
+        )
+        assertEquals(setOf(StylusInput.Trigger.BARREL_BUTTON), core.triggersSeen())
+    }
+
+    /** Discovery works with hover forwarding off, too — it is not a hover feature. */
+    @Test
+    fun discoveryWorksWithHoverForwardingOff() {
+        val core = StylusInput()
+        core.setHoverEnabled(false)
+        core.processHover(
+            StylusInput.HoverFrame(
+                StylusInput.HoverAction.MOVE,
+                StylusInput.Tool.STYLUS,
+                point(0.5f, 0.5f, 0f),
+                eventTimeMs = 100,
+                barrelButtonHeld = true,
+            ),
+        )
+        assertEquals(setOf(StylusInput.Trigger.BARREL_BUTTON), core.triggersSeen())
     }
 
     // --- Trigger binding ------------------------------------------------------------

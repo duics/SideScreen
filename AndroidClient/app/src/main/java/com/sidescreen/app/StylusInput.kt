@@ -171,6 +171,13 @@ class StylusInput {
         val point: Point,
         val distance: Float? = null,
         val eventTimeMs: Long = 0L,
+        /**
+         * `MotionEvent.BUTTON_STYLUS_PRIMARY` is set. Hovering with the button held
+         * is how a user naturally presses it, so this is the main way the barrel
+         * button gets *discovered* — the contact path only ever sees it if the
+         * button happened to be held at touch-down.
+         */
+        val barrelButtonHeld: Boolean = false,
     )
 
     /** One stylus message to hand to `StreamClient.sendStylus`. */
@@ -266,7 +273,6 @@ class StylusInput {
      */
     fun isInProximity(nowMs: Long): Boolean {
         val last = lastHoverMs ?: return false
-        if (!hoverEnabled) return false
         // Bounded at both ends. A sample stamped in the future is not evidence the
         // pen is here now, and an unbounded lower end would read a negative elapsed
         // time as "recent" — which is the same latch this design exists to avoid.
@@ -354,7 +360,6 @@ class StylusInput {
      */
     fun setHoverEnabled(enabled: Boolean) {
         hoverEnabled = enabled
-        if (!enabled) lastHoverMs = null
     }
 
     /**
@@ -377,7 +382,6 @@ class StylusInput {
      * heartbeat, and both sides expire proximity when the heartbeats stop.
      */
     fun processHover(frame: HoverFrame): Decision {
-        if (!hoverEnabled) return Decision(handled = false)
         if (!frame.tool.isStylus) return Decision(handled = false)
         // An exit is consumed because it is ours, and otherwise ignored. Acting on
         // it would reintroduce the dependency this design removes, and it is wrong
@@ -388,6 +392,15 @@ class StylusInput {
         if (strokePointerId != null) return Decision(handled = true)
 
         lastHoverMs = frame.eventTimeMs
+        // R9 is not a hover feature and must not be switched off with one. The
+        // preference governs whether hover is *forwarded* — whether the Mac cursor
+        // follows the pen — and proximity is tracked either way, because palm
+        // suppression before contact depends on it. A user who turns the cursor
+        // off to stop it being distracting would otherwise silently lose the
+        // wrist rejection that R8 promises drawing keeps.
+        if (frame.barrelButtonHeld) observedTriggers.add(Trigger.BARREL_BUTTON)
+        if (frame.tool == Tool.ERASER) observedTriggers.add(Trigger.ERASER_TOOL)
+        if (!hoverEnabled) return Decision(handled = true)
         val at = hoverSample(frame.point.x, frame.point.y)
         // A hover sample is not a contact, so it reports the trigger state live
         // rather than a frozen one: that is how a hovering eraser announces its

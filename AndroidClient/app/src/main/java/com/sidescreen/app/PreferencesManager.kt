@@ -50,4 +50,48 @@ class PreferencesManager(
     var connectionMode: ConnectionMode
         get() = ConnectionMode.fromName(prefs.getString("connection_mode", null))
         set(value) = prefs.edit().putString("connection_mode", value.name).apply()
+
+    /**
+     * Which pen trigger means what, for `StylusInput.restoreBindings` at startup and
+     * `StylusInput.currentBindings` after the user rebinds.
+     *
+     * Empty by default: nothing is bound out of the box, so a device whose triggers
+     * have never been pressed behaves exactly as it did before this setting existed.
+     */
+    var penBindings: Map<StylusInput.Trigger, StylusInput.PenAction>
+        get() = decodePenBindings(prefs.getString("pen_bindings", null))
+        set(value) = prefs.edit().putString("pen_bindings", encodePenBindings(value)).apply()
+
+    companion object {
+        /**
+         * `TRIGGER:ACTION` pairs joined by commas — the mapping is at most two
+         * entries, so anything heavier than this would be ceremony. Enum *names*,
+         * never ordinals: an ordinal silently repoints when someone reorders an enum,
+         * turning a saved eraser binding into a right click with no failure anywhere.
+         *
+         * Neither separator can occur inside a Kotlin enum name, so no escaping is needed.
+         */
+        fun encodePenBindings(map: Map<StylusInput.Trigger, StylusInput.PenAction>): String =
+            map.entries.joinToString(",") { "${it.key.name}:${it.value.name}" }
+
+        /**
+         * The inverse, total by construction. Every way a stored string can fail to
+         * parse — an unknown trigger, an unknown action, a missing colon, a stray
+         * empty field — drops that one entry and keeps the rest, so a downgrade to a
+         * build that predates an enum constant, or a rename, costs the user one
+         * binding rather than bricking the settings screen with an exception.
+         */
+        fun decodePenBindings(stored: String?): Map<StylusInput.Trigger, StylusInput.PenAction> {
+            if (stored.isNullOrEmpty()) return emptyMap()
+            val out = LinkedHashMap<StylusInput.Trigger, StylusInput.PenAction>()
+            for (entry in stored.split(",")) {
+                val parts = entry.split(":")
+                if (parts.size != 2) continue
+                val trigger = StylusInput.Trigger.values().firstOrNull { it.name == parts[0] } ?: continue
+                val action = StylusInput.PenAction.values().firstOrNull { it.name == parts[1] } ?: continue
+                out[trigger] = action
+            }
+            return out
+        }
+    }
 }
