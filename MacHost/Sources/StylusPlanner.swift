@@ -89,11 +89,28 @@ final class StylusPlanner {
     /// Mirrors `StylusInput.PROXIMITY_WINDOW_MS` on the client.
     static let proximityWindow: TimeInterval = 0.15
 
-    /// R26. The same bounds the finger pen path uses, in the units this class
-    /// works in. `GestureThresholds` times with `DispatchTime`, so its values are
-    /// nanoseconds; everything here is seconds.
+    /// R26. Timing bounds are the finger path's, in the units this class works
+    /// in — `GestureThresholds` times with `DispatchTime`, so its values are
+    /// nanoseconds and everything here is seconds. How long a tap may last, and
+    /// how long a double click may take, are properties of the hand rather than
+    /// the instrument.
     static let doubleTapMaxTime = TimeInterval(GestureThresholds.doubleTapMaxTime) / 1_000_000_000
     static let tapMaxTime = TimeInterval(GestureThresholds.tapMaxTime) / 1_000_000_000
+
+    /// Distance bounds are NOT the finger path's, and deliberately so.
+    ///
+    /// A fingertip rests in a contact patch and has friction to steady it; a pen
+    /// nib is a point with neither. The finger values — 15 points to stay a tap,
+    /// 20 to reach a second one — map to roughly 1.7mm and 2.3mm on the tablet,
+    /// which ordinary hand tremor exceeds. Device testing showed exactly that:
+    /// double clicks failed whenever a tap drifted far enough to be read as a
+    /// drag. These are ~4.5mm and ~6mm, still an order of magnitude short of a
+    /// deliberate stroke.
+    ///
+    /// The finger path keeps its own values untouched: they are tuned for a
+    /// different instrument and changing them would alter shipped behavior.
+    static let stylusTapMaxDistance: Double = 40
+    static let stylusDoubleTapMaxDistance: Double = 55
 
     private(set) var isStrokeOpen = false
     /// A single flag whose transitions emit enter/exit. Balance is structural
@@ -288,7 +305,7 @@ final class StylusPlanner {
               clickCount == 1,
               let start = strokeStartSample,
               endTime - strokeStartTime < Self.tapMaxTime,
-              distance(end, start) < GestureThresholds.tapMaxDistance else {
+              distance(end, start) < Self.stylusTapMaxDistance else {
             lastTapTime = 0
             lastTapSample = nil
             return
@@ -320,7 +337,7 @@ final class StylusPlanner {
         // after it, is click 2 of a double click.
         strokeDisplaySize = displaySize
         let inWindow = now - lastTapTime < Self.doubleTapMaxTime
-        let inReach = lastTapSample.map { distance(first, $0) < GestureThresholds.doubleTapMaxDistance } ?? false
+        let inReach = lastTapSample.map { distance(first, $0) < Self.stylusDoubleTapMaxDistance } ?? false
         clickCount = (lastTapTime != 0 && inWindow && inReach) ? 2 : 1
 
         steps.append(.cancelHostGesture)

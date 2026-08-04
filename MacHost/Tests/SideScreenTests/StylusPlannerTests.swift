@@ -79,6 +79,30 @@ final class StylusPlannerTests: XCTestCase {
         XCTAssertEqual(clickCounts(tap(at: 0.5, 0.5, from: 10)), [1, 1])
     }
 
+    /// Device testing found double clicks failing whenever a tap drifted enough to
+    /// read as a drag. A pen nib is a point with no friction to steady it, so it
+    /// drifts further than a fingertip does — this drift is past the finger path's
+    /// 15-point bound and inside the stylus one, and must still seed a double click.
+    func testATapThatDriftsPastTheFingerBoundStillSeedsADoubleClick() {
+        // 25 points across this display: beyond GestureThresholds.tapMaxDistance,
+        // well inside StylusPlanner.stylusTapMaxDistance.
+        _ = planner.plan(message(.down, sample(0.50, 0.50, 0.5)), displaySize: displaySize, now: 10)
+        let first = planner.plan(message(.up, sample(0.525, 0.50, 0)), displaySize: displaySize, now: 10.05)
+        XCTAssertEqual(clickCounts(first), [1])
+
+        XCTAssertEqual(clickCounts(tap(at: 0.525, 0.50, from: 10.15)), [2, 2],
+                       "a drifting tap is still a tap")
+    }
+
+    /// The looser bound is not unbounded: a deliberate stroke is still a drag.
+    func testAContactThatTravelsPastTheStylusBoundIsADrag() {
+        _ = planner.plan(message(.down, sample(0.50, 0.50, 0.5)), displaySize: displaySize, now: 20)
+        _ = planner.plan(message(.up, sample(0.60, 0.50, 0)), displaySize: displaySize, now: 20.05)
+
+        XCTAssertEqual(clickCounts(tap(at: 0.60, 0.50, from: 20.15)), [1, 1],
+                       "100 points of travel is a stroke, and seeds nothing")
+    }
+
     func testAQuickNearbySecondTapIsClickTwoOnBothPressAndRelease() {
         _ = tap(at: 0.5, 0.5, from: 10)
         // 0.1s after the first tap released, one point away from it: inside both
